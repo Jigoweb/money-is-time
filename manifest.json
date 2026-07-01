@@ -1,23 +1,30 @@
 {
-    "manifest_version": 3,
-    "name": "Money is Time",
-    "version": "1.0",
-    "description": "Converts prices to work hours based on your hourly income.",
-    "permissions": ["activeTab", "storage"],
-    "background": {
-      "service_worker": "background.js"
-    },
-    "action": {
-      "default_popup": "popup.html"
-    },
-    "content_scripts": [
-      {
-        "matches": ["<all_urls>"],
-        "js": ["contentScript.js"],
-        "run_at": "document_idle"
-      }
-    ],
-    "icons": {
-      "48": "money-is-time-icon.png"
+  "manifest_version": 3,
+  "name": "Money is Time",
+  "version": "1.1.0",
+  "description": "Converts prices to work hours based on your hourly income.",
+  "permissions": ["storage"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "money-is-time-icon.png",
+      "48": "money-is-time-icon.png",
+      "128": "money-is-time-icon.png"
     }
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["contentScript.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "money-is-time-icon.png",
+    "48": "money-is-time-icon.png",
+    "128": "money-is-time-icon.png"
   }
+}
