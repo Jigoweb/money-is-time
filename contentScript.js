@@ -1,10 +1,109 @@
 // contentScript.js
 
-/**
- * Carica i messaggi localizzati in base alla lingua selezionata.
- * @param {string} language - Il codice della lingua preferita (es. 'en', 'it').
- * @returns {Object} - Un oggetto contenente i messaggi localizzati.
- */
+const BADGE_CLASS = 'money-is-time-badge';
+const PROCESSED_ATTR = 'data-money-is-time-processed';
+const MONTHLY_WEEKS = 52 / 12;
+const OBSERVER_DEBOUNCE_MS = 200;
+
+const CURRENCY_SYMBOLS = {
+  USD: '$',
+  EUR: '€',
+  GBP: '£',
+  JPY: '¥',
+  CHF: 'CHF',
+  CAD: 'CAD',
+  AUD: 'AUD',
+  INR: '₹',
+  BRL: 'R$',
+  SEK: 'kr',
+  NOK: 'kr',
+  PLN: 'zł',
+  CNY: '¥',
+  KRW: '₩',
+};
+
+const PRICE_SELECTORS = [
+  '.a-price .a-offscreen',
+  '.a-price[data-a-color="price"] .a-offscreen',
+  '#priceblock_ourprice',
+  '#priceblock_dealprice',
+  '.price-item--regular',
+  '.price-item--sale',
+  '.price__regular .price-item',
+  '.price__sale .price-item',
+  '[data-product-price]',
+  '.product-price',
+  '.woocommerce-Price-amount',
+  '.price .amount',
+  '[itemprop="price"]',
+  '.x-price-primary',
+  '.notranslate[data-testid="x-price-primary"]',
+  '.sales-price',
+  '.current-price',
+  '.product__price',
+  '.money',
+];
+
+const EXCLUDED_TAGS = new Set([
+  'SCRIPT',
+  'STYLE',
+  'NOSCRIPT',
+  'IFRAME',
+  'OBJECT',
+  'CODE',
+  'PRE',
+  'INPUT',
+  'TEXTAREA',
+  'SVG',
+]);
+
+let hourlyIncome = null;
+let localizedMessages = loadLocalizedMessages('en');
+let userCurrency = 'EUR';
+let extensionEnabled = true;
+let priceRegex = null;
+let observer = null;
+let observerTimer = null;
+let processedNodes = new WeakSet();
+let stylesInjected = false;
+
+function injectStyles() {
+  if (stylesInjected) {
+    return;
+  }
+
+  const style = document.createElement('style');
+  style.textContent = `
+    .${BADGE_CLASS} {
+      font-size: 0.85em;
+      opacity: 0.85;
+      white-space: nowrap;
+    }
+  `;
+  document.documentElement.appendChild(style);
+  stylesInjected = true;
+}
+
+function queryPriceElements(root = document) {
+  const elements = new Set();
+
+  PRICE_SELECTORS.forEach((selector) => {
+    try {
+      root.querySelectorAll(selector).forEach((element) => elements.add(element));
+    } catch (_error) {
+      // Ignore invalid selectors on some documents.
+    }
+  });
+
+  root.querySelectorAll('*').forEach((element) => {
+    if (element.shadowRoot) {
+      queryPriceElements(element.shadowRoot).forEach((shadowElement) => elements.add(shadowElement));
+    }
+  });
+
+  return elements;
+}
+
 function loadLocalizedMessages(language) {
   const messages = {
     en: {
@@ -19,150 +118,182 @@ function loadLocalizedMessages(language) {
       and: 'e',
       ofWork: 'di lavoro',
     },
-    // Aggiungi altre lingue se necessario
   };
 
-  return messages[language] || messages['en'];
+  return messages[language] || messages.en;
 }
 
-/**
- * Converte un prezzo in ore lavorative in base al reddito orario dell'utente.
- * @param {number} price - Il prezzo da convertire.
- * @param {number} hourlyIncome - Il reddito orario dell'utente.
- * @returns {number|null} - Le ore lavorative necessarie per acquistare il prezzo, o null se errore.
- */
-function convertPriceToWorkHours(price, hourlyIncome) {
-  if (hourlyIncome <= 0) {
-    console.error('Il reddito orario deve essere maggiore di zero.');
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function buildCurrencyPattern() {
+  const codes = Object.keys(CURRENCY_SYMBOLS);
+  const symbols = Object.values(CURRENCY_SYMBOLS).map(escapeRegex);
+  return `(?:${symbols.join('|')}|${codes.join('|')})`;
+}
+
+function buildPriceRegex() {
+  const currencyPattern = buildCurrencyPattern();
+  const numberPattern = '\\d+(?:[\\s.,]\\d+)*';
+  return new RegExp(
+    `(?:(${currencyPattern})\\s*(${numberPattern})|(${numberPattern})\\s*(${currencyPattern}))`,
+    'gi'
+  );
+}
+
+function normalizeCurrencyToken(token) {
+  if (!token) {
     return null;
   }
-  return price / hourlyIncome;
+
+  const trimmed = token.trim().toUpperCase();
+  if (CURRENCY_SYMBOLS[trimmed]) {
+    return trimmed;
+  }
+
+  const bySymbol = Object.entries(CURRENCY_SYMBOLS).find(
+    ([, symbol]) => symbol.toUpperCase() === trimmed || symbol === token.trim()
+  );
+
+  return bySymbol ? bySymbol[0] : null;
 }
 
-/**
- * Formatta le ore lavorative in ore e minuti.
- * @param {number} workHours - Le ore lavorative.
- * @param {Object} localizedMessages - Oggetto contenente i messaggi localizzati.
- * @returns {string} - Il tempo formattato in ore e minuti.
- */
-function formatWorkTime(workHours, localizedMessages) {
-  const totalMinutes = Math.round(workHours * 60);
-
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-
-  let timeString = '';
-
-  if (hours > 0) {
-    timeString += `${hours} ${localizedMessages.hours}`;
-  }
-
-  if (minutes > 0) {
-    if (hours > 0) {
-      timeString += ` ${localizedMessages.and} `;
-    }
-    timeString += `${minutes} ${localizedMessages.minutes}`;
-  }
-
-  if (timeString === '') {
-    // Se il tempo è inferiore a un minuto
-    timeString = `1 ${localizedMessages.minutes}`;
-  }
-
-  return `${timeString} ${localizedMessages.ofWork}`;
-}
-
-/**
- * Parsea una stringa di importo e restituisce il valore numerico.
- * @param {string} amount - La stringa dell'importo da parsare.
- * @returns {number|null} - L'importo numerico, o null se non è possibile parsare.
- */
 function parsePrice(amount) {
-  // Rimuove spazi e caratteri non numerici eccetto ',' e '.'
+  if (!amount) {
+    return null;
+  }
+
   let sanitizedAmount = amount.replace(/\s+/g, '').replace(/[^\d.,-]/g, '');
 
-  // Gestione dei segni negativi
   let isNegative = false;
   if (sanitizedAmount.startsWith('-')) {
     isNegative = true;
     sanitizedAmount = sanitizedAmount.substring(1);
   }
 
-  // Se l'importo contiene sia '.' che ',', determiniamo quale è il separatore decimale
+  if (!sanitizedAmount) {
+    return null;
+  }
+
+  const lastComma = sanitizedAmount.lastIndexOf(',');
+  const lastDot = sanitizedAmount.lastIndexOf('.');
   let price = null;
 
-  if (sanitizedAmount.indexOf(',') > -1 && sanitizedAmount.indexOf('.') > -1) {
-    // Presumiamo che '.' sia il separatore delle migliaia e ',' il separatore decimale
-    sanitizedAmount = sanitizedAmount.replace(/\./g, '').replace(',', '.');
-    price = parseFloat(sanitizedAmount);
-  } else if (sanitizedAmount.indexOf('.') > -1) {
-    // Se c'è solo '.', verifichiamo se è probabile che sia un separatore decimale o delle migliaia
+  if (lastComma > -1 && lastDot > -1) {
+    if (lastDot > lastComma) {
+      sanitizedAmount = sanitizedAmount.replace(/,/g, '');
+      price = parseFloat(sanitizedAmount);
+    } else {
+      sanitizedAmount = sanitizedAmount.replace(/\./g, '').replace(',', '.');
+      price = parseFloat(sanitizedAmount);
+    }
+  } else if (lastDot > -1) {
     const parts = sanitizedAmount.split('.');
-    if (parts[1] && parts[1].length === 3) {
-      // Presumiamo che '.' sia un separatore delle migliaia
+    if (parts[parts.length - 1].length === 3 && parts.length > 1) {
       sanitizedAmount = sanitizedAmount.replace(/\./g, '');
       price = parseFloat(sanitizedAmount);
     } else {
-      // Presumiamo che '.' sia un separatore decimale
       price = parseFloat(sanitizedAmount);
     }
-  } else if (sanitizedAmount.indexOf(',') > -1) {
-    // Presumiamo che ',' sia il separatore decimale
-    sanitizedAmount = sanitizedAmount.replace(',', '.');
-    price = parseFloat(sanitizedAmount);
+  } else if (lastComma > -1) {
+    const parts = sanitizedAmount.split(',');
+    if (parts[parts.length - 1].length === 3 && parts.length > 1) {
+      sanitizedAmount = sanitizedAmount.replace(/,/g, '');
+      price = parseFloat(sanitizedAmount);
+    } else {
+      price = parseFloat(sanitizedAmount.replace(',', '.'));
+    }
   } else {
-    // Nessun separatore, convertiamo direttamente
     price = parseFloat(sanitizedAmount);
   }
 
-  if (isNaN(price)) {
+  if (Number.isNaN(price)) {
     return null;
   }
 
   return isNegative ? -price : price;
 }
 
-/**
- * Verifica se un nodo o uno dei suoi genitori ha lo stile 'text-decoration: line-through'.
- * @param {Node} node - Il nodo da verificare.
- * @returns {boolean} - True se il nodo o uno dei suoi genitori ha lo stile 'line-through'.
- */
+function convertPriceToWorkHours(price, income) {
+  if (!income || income <= 0 || price <= 0) {
+    return null;
+  }
+
+  return price / income;
+}
+
+function formatWorkTime(workHours, messages) {
+  const totalMinutes = Math.round(workHours * 60);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  let timeString = '';
+
+  if (hours > 0) {
+    timeString += `${hours} ${messages.hours}`;
+  }
+
+  if (minutes > 0) {
+    if (hours > 0) {
+      timeString += ` ${messages.and} `;
+    }
+    timeString += `${minutes} ${messages.minutes}`;
+  }
+
+  if (!timeString) {
+    timeString = `1 ${messages.minutes}`;
+  }
+
+  return `${timeString} ${messages.ofWork}`;
+}
+
+function stripAnnotation(text) {
+  if (!text) {
+    return '';
+  }
+
+  return text.replace(/\s+\([^)]*(?:of work|di lavoro)\)\s*$/, '').trim();
+}
+
+function textMightContainPrice(text) {
+  if (!text || text.length > 500) {
+    return false;
+  }
+
+  return /(?:USD|EUR|GBP|JPY|CHF|CAD|AUD|INR|BRL|SEK|NOK|PLN|CNY|KRW|\$|€|£|¥|₹|₩|zł|kr|R\$)/i.test(text);
+}
+
 function isCrossedOut(node) {
-  let currentNode = node.parentNode;
+  let currentNode = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+
   while (currentNode && currentNode !== document.body) {
     const style = window.getComputedStyle(currentNode);
     if (style.textDecorationLine.includes('line-through')) {
       return true;
     }
-    currentNode = currentNode.parentNode;
+    currentNode = currentNode.parentElement;
   }
+
   return false;
 }
 
-/**
- * Verifica se un nodo è nascosto (display: none o visibility: hidden).
- * @param {Node} node - Il nodo da verificare.
- * @returns {boolean} - True se il nodo o uno dei suoi genitori è nascosto.
- */
 function isNodeHidden(node) {
-  let currentNode = node.parentNode;
+  let currentNode = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+
   while (currentNode && currentNode !== document.body) {
     const style = window.getComputedStyle(currentNode);
-    if (style && (style.display === 'none' || style.visibility === 'hidden')) {
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
       return true;
     }
-    currentNode = currentNode.parentNode;
+    currentNode = currentNode.parentElement;
   }
+
   return false;
 }
 
-/**
- * Verifica se un nodo è un campo di input o un elemento modificabile dall'utente.
- * @param {Node} node - Il nodo da verificare.
- * @returns {boolean} - True se il nodo o uno dei suoi genitori è un campo di input o modificabile.
- */
 function isEditableNode(node) {
-  let currentNode = node.parentNode;
+  let currentNode = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+
   while (currentNode && currentNode !== document.body) {
     if (
       currentNode.isContentEditable ||
@@ -170,263 +301,374 @@ function isEditableNode(node) {
     ) {
       return true;
     }
-    currentNode = currentNode.parentNode;
+    currentNode = currentNode.parentElement;
   }
+
   return false;
 }
 
-// Set per tracciare i nodi già processati
-let processedNodes = new WeakSet();
+function shouldProcessPrice(currencyCode, price) {
+  if (!currencyCode || price === null || price <= 0) {
+    return false;
+  }
 
-// Variabili globali per le impostazioni
-let hourlyIncome;
-let localizedMessages;
-let userCurrency;
-let extensionEnabled = true; // Stato di attivazione dell'estensione
-
-// Funzione per inizializzare l'estensione
-function initializeExtension() {
-  console.log('Initializing extension...');
-
-  // Imposta il listener per i cambiamenti nelle impostazioni
-  chrome.storage.onChanged.addListener(onStorageChange);
-
-  // Recupera le impostazioni iniziali
-  chrome.storage.sync.get(
-    ['hourlyIncome', 'preferredLanguage', 'preferredCurrency', 'extensionEnabled'],
-    (result) => {
-      console.log('Initial storage values:', result);
-
-      hourlyIncome = result.hourlyIncome || null;
-      const language = result.preferredLanguage || navigator.language.slice(0, 2) || 'en';
-      userCurrency = result.preferredCurrency || 'EUR'; // Default a EUR se non impostato
-      extensionEnabled = result.extensionEnabled !== undefined ? result.extensionEnabled : true;
-
-      // Carica i messaggi localizzati
-      localizedMessages = loadLocalizedMessages(language);
-
-      // Resetta il set dei nodi processati
-      processedNodes = new WeakSet();
-
-      // Processa l'intera pagina se l'estensione è attiva
-      if (extensionEnabled && hourlyIncome) {
-        processElement(document.body);
-      }
-
-      // Osserva le modifiche al DOM per gestire contenuti dinamici
-      observeDOMChanges();
-    }
-  );
+  return currencyCode === userCurrency;
 }
 
-// Funzione per osservare le modifiche al DOM
-function observeDOMChanges() {
-  console.log('Observing DOM changes...');
+function convertMatchToWorkTime(match, currency1, amount1, amount2, currency2) {
+  const currencyToken = currency1 || currency2;
+  const amountToken = amount1 || amount2;
+  const currencyCode = normalizeCurrencyToken(currencyToken);
+  const price = parsePrice(amountToken);
 
-  const observer = new MutationObserver((mutations) => {
-    mutations.forEach((mutation) => {
-      if (mutation.type === 'childList') {
-        mutation.addedNodes.forEach((node) => {
-          if (node.nodeType === Node.ELEMENT_NODE) {
-            processElement(node);
-          } else if (node.nodeType === Node.TEXT_NODE) {
-            processTextNode(node);
-          }
-        });
-      } else if (mutation.type === 'characterData') {
-        processTextNode(mutation.target);
-      } else if (mutation.type === 'attributes') {
-        if (mutation.target.nodeType === Node.ELEMENT_NODE) {
-          processElement(mutation.target);
-        }
-      }
-    });
-  });
+  if (!shouldProcessPrice(currencyCode, price)) {
+    return null;
+  }
 
-  // Configurazione del MutationObserver
-  observer.observe(document.body, {
-    childList: true,
-    subtree: true,
-    characterData: true,
-    attributes: true,
-    characterDataOldValue: true,
-    attributeOldValue: true,
-  });
+  const workHours = convertPriceToWorkHours(price, hourlyIncome);
+  if (workHours === null) {
+    return null;
+  }
+
+  return formatWorkTime(workHours, localizedMessages);
 }
 
-// Funzione per ripristinare il testo originale
-function restoreOriginalText(element) {
-  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, null, false);
-  let node;
-  while ((node = walker.nextNode())) {
-    if (node.originalText && node.nodeValue !== node.originalText) {
-      node.nodeValue = node.originalText;
-    }
-  }
-}
-
-// Funzione per gestire i cambiamenti nello storage
-function onStorageChange(changes, area) {
-  console.log('onStorageChange triggered:', changes, area);
-
-  if (area === 'sync') {
-    let shouldReinitialize = false;
-
-    if ('hourlyIncome' in changes) {
-      hourlyIncome = changes.hourlyIncome.newValue;
-      console.log('hourlyIncome updated:', hourlyIncome);
-      shouldReinitialize = true;
-    }
-
-    if ('preferredLanguage' in changes) {
-      const language = changes.preferredLanguage.newValue || navigator.language.slice(0, 2) || 'en';
-      localizedMessages = loadLocalizedMessages(language);
-      console.log('preferredLanguage updated:', language);
-      shouldReinitialize = true;
-    }
-
-    if ('preferredCurrency' in changes) {
-      userCurrency = changes.preferredCurrency.newValue || 'EUR';
-      console.log('preferredCurrency updated:', userCurrency);
-      shouldReinitialize = true;
-    }
-
-    if ('extensionEnabled' in changes) {
-      extensionEnabled = changes.extensionEnabled.newValue;
-      console.log('extensionEnabled updated:', extensionEnabled);
-      shouldReinitialize = true;
-
-      // Ripristina il testo originale se l'estensione è disattivata
-      if (!extensionEnabled) {
-        restoreOriginalText(document.body);
-      }
-    }
-
-    if (shouldReinitialize) {
-      console.log('Reinitializing extension...');
-      // Resetta il set dei nodi processati
-      processedNodes = new WeakSet();
-
-      if (extensionEnabled && hourlyIncome) {
-        // Riprocessa l'intera pagina
-        processElement(document.body);
-      } else if (!extensionEnabled) {
-        // Ripristina il testo originale
-        restoreOriginalText(document.body);
-      }
-    }
-  }
-}
-
-// Inizializza l'estensione
-initializeExtension();
-
-// Funzione per processare i nodi di testo
-function processTextNode(node) {
-  // Se il reddito orario non è impostato o l'estensione è disattivata, non processare il nodo
-  if (!hourlyIncome || !extensionEnabled) {
-    return;
+function replacePricesInText(text) {
+  if (!textMightContainPrice(text)) {
+    return text;
   }
 
-  // Evita di processare nodi già elaborati durante questa esecuzione
-  if (processedNodes.has(node)) {
-    return;
-  }
-
-  // Evita di processare nodi all'interno di campi di input o contenuti modificabili
-  if (isEditableNode(node)) {
-    return;
-  }
-
-  // Evita di processare prezzi barrati
-  if (isCrossedOut(node)) {
-    return;
-  }
-
-  // Evita di processare nodi nascosti
-  if (isNodeHidden(node)) {
-    return;
-  }
-
-  // Se il testo originale non è stato ancora memorizzato, lo memorizziamo
-  if (!node.originalText) {
-    node.originalText = node.nodeValue;
-  }
-
-  let text = node.originalText;
-
-  // Definizione dei simboli di valuta e dei codici ISO 4217
-  const currencySymbols = {
-    'USD': '$',
-    'EUR': '€',
-    'GBP': '£',
-    'JPY': '¥',
-    // Aggiungi altre valute se necessario
-  };
-
-  const currencyCodes = Object.keys(currencySymbols);
-  const currencySymbolsPattern = Object.values(currencySymbols).map(sym => `\\${sym}`).join('|');
-  const currencyCodesPattern = currencyCodes.join('|');
-
-  const currencyPattern = `(?:${currencySymbolsPattern}|${currencyCodesPattern})`;
-
-  const numberPattern = '\\d{1,3}(?:[.,]\\d{3})*(?:[.,]\\d{2})?';
-
-  // Regex per individuare i prezzi con simboli o codici di valuta supportati
-  const regex = new RegExp(
-    `(${currencyPattern})\\s*(${numberPattern})|(${numberPattern})\\s*(${currencyPattern})`,
-    'gi'
-  );
-
-  // Sostituisce i prezzi con il testo di conversione
-  const newText = text.replace(regex, (match, currency1, amount1, amount2, currency2) => {
-    const currency = currency1 || currency2;
-    const amount = amount1 || amount2;
-
-    // Assicura che sia presente sia la valuta che l'importo
-    if (!currency || !amount) {
+  return text.replace(priceRegex, (match, currency1, amount1, amount2, currency2) => {
+    const formattedTime = convertMatchToWorkTime(match, currency1, amount1, amount2, currency2);
+    if (!formattedTime) {
       return match;
     }
 
-    const price = parsePrice(amount);
-    if (!isNaN(price)) {
-      const workHours = convertPriceToWorkHours(price, hourlyIncome);
-      if (workHours !== null) {
-        const formattedTime = formatWorkTime(workHours, localizedMessages);
-        return `${currency}${amount} (${formattedTime})`; // Ricostruisce il prezzo con valuta e importo
-      }
+    return `${match} (${formattedTime})`;
+  });
+}
+
+function removeBadges(root = document.body) {
+  root.querySelectorAll(`.${BADGE_CLASS}`).forEach((badge) => badge.remove());
+  root.querySelectorAll(`[${PROCESSED_ATTR}]`).forEach((element) => {
+    element.removeAttribute(PROCESSED_ATTR);
+  });
+}
+
+function restoreOriginalText(element) {
+  removeBadges(element);
+
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, null);
+  let node;
+
+  while ((node = walker.nextNode())) {
+    if (node.originalText) {
+      node.nodeValue = node.originalText;
+      delete node.originalText;
+    } else {
+      node.nodeValue = stripAnnotation(node.nodeValue);
     }
-    return match;
+    processedNodes.delete(node);
+  }
+}
+
+function upsertBadge(element, formattedTime) {
+  let badge = element.querySelector(`:scope > .${BADGE_CLASS}`);
+
+  if (!badge) {
+    badge = document.createElement('span');
+    badge.className = BADGE_CLASS;
+    badge.setAttribute('aria-label', formattedTime);
+    element.appendChild(badge);
+  }
+
+  badge.textContent = ` (${formattedTime})`;
+  element.setAttribute(PROCESSED_ATTR, 'true');
+}
+
+function processPriceElement(element) {
+  if (!extensionEnabled || !hourlyIncome) {
+    return;
+  }
+
+  if (!element || EXCLUDED_TAGS.has(element.tagName) || element.closest(`.${BADGE_CLASS}`)) {
+    return;
+  }
+
+  if (isEditableNode(element) || isCrossedOut(element) || isNodeHidden(element)) {
+    return;
+  }
+
+  const sourceText =
+    element.getAttribute('content') ||
+    element.getAttribute('data-product-price') ||
+    element.textContent;
+
+  if (!textMightContainPrice(sourceText)) {
+    return;
+  }
+
+  const plainText = stripAnnotation(sourceText.replace(/\s+/g, ' ').trim());
+  priceRegex.lastIndex = 0;
+  const regexMatch = priceRegex.exec(plainText);
+  priceRegex.lastIndex = 0;
+
+  if (!regexMatch) {
+    return;
+  }
+
+  const [, currency1, amount1, amount2, currency2] = regexMatch;
+  const formattedTime = convertMatchToWorkTime(
+    regexMatch[0],
+    currency1,
+    amount1,
+    amount2,
+    currency2
+  );
+
+  if (!formattedTime) {
+    return;
+  }
+
+  if (element.hasAttribute('content') || element.children.length === 0) {
+    upsertBadge(element, formattedTime);
+    return;
+  }
+
+  upsertBadge(element, formattedTime);
+}
+
+function processStructuredPrices() {
+  document.querySelectorAll('[itemprop="price"]').forEach((element) => {
+    processPriceElement(element);
   });
 
-  // Aggiorna il nodo di testo se è cambiato
-  if (newText !== node.nodeValue) {
+  document.querySelectorAll('script[type="application/ld+json"]').forEach((script) => {
+    try {
+      const data = JSON.parse(script.textContent);
+      const items = Array.isArray(data) ? data : [data];
+
+      items.forEach((item) => {
+        const offers = item.offers;
+        const offerList = Array.isArray(offers) ? offers : offers ? [offers] : [];
+        offerList.forEach((offer) => {
+          if (!offer || !offer.price) {
+            return;
+          }
+
+          const currencyCode = normalizeCurrencyToken(offer.priceCurrency || userCurrency);
+          const price = parsePrice(String(offer.price));
+
+          if (!shouldProcessPrice(currencyCode, price)) {
+            return;
+          }
+
+          const formattedTime = formatWorkTime(
+            convertPriceToWorkHours(price, hourlyIncome),
+            localizedMessages
+          );
+
+          if (!formattedTime) {
+            return;
+          }
+
+          const linkedPrice = document.querySelector('[itemprop="price"]');
+          if (linkedPrice) {
+            upsertBadge(linkedPrice, formattedTime);
+          }
+        });
+      });
+    } catch (_error) {
+      // Ignore invalid JSON-LD blocks.
+    }
+  });
+}
+
+function processTextNode(node) {
+  if (!extensionEnabled || !hourlyIncome) {
+    return;
+  }
+
+  if (isEditableNode(node) || isCrossedOut(node) || isNodeHidden(node)) {
+    return;
+  }
+
+  const currentValue = node.nodeValue;
+  const strippedValue = stripAnnotation(currentValue);
+
+  if (!textMightContainPrice(strippedValue)) {
+    return;
+  }
+
+  if (processedNodes.has(node)) {
+    if (node.originalText !== strippedValue) {
+      node.originalText = strippedValue;
+      processedNodes.delete(node);
+    } else {
+      return;
+    }
+  }
+
+  if (!node.originalText) {
+    node.originalText = strippedValue;
+  } else if (stripAnnotation(node.originalText) !== strippedValue) {
+    node.originalText = strippedValue;
+  }
+
+  const newText = replacePricesInText(node.originalText);
+
+  if (newText !== currentValue) {
     node.nodeValue = newText;
     processedNodes.add(node);
   }
 }
 
-// Funzione per processare un elemento del DOM
 function processElement(element) {
-  // Se l'estensione è disattivata o il reddito orario non è impostato, non processare
-  if (!extensionEnabled || !hourlyIncome) {
+  if (!extensionEnabled || !hourlyIncome || !element || element.nodeType !== Node.ELEMENT_NODE) {
     return;
   }
 
-  // Evita di processare elementi non rilevanti
-  if (['SCRIPT', 'STYLE', 'NOSCRIPT', 'IFRAME', 'OBJECT', 'CODE', 'PRE', 'INPUT', 'TEXTAREA'].includes(element.tagName)) {
+  if (EXCLUDED_TAGS.has(element.tagName) || element.isContentEditable) {
     return;
   }
 
-  // Evita di processare elementi modificabili dall'utente
-  if (element.isContentEditable) {
+  if (element.matches && PRICE_SELECTORS.some((selector) => element.matches(selector))) {
+    processPriceElement(element);
+  }
+
+  element.querySelectorAll(PRICE_SELECTORS.join(',')).forEach(processPriceElement);
+
+  if (!textMightContainPrice(element.textContent)) {
     return;
   }
 
-  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, null, false);
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, {
+    acceptNode(currentNode) {
+      if (currentNode.parentElement && currentNode.parentElement.closest(`.${BADGE_CLASS}`)) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
 
   let node;
   while ((node = walker.nextNode())) {
     processTextNode(node);
   }
 }
+
+function processPage() {
+  if (!extensionEnabled || !hourlyIncome) {
+    return;
+  }
+
+  injectStyles();
+  queryPriceElements().forEach(processPriceElement);
+  processStructuredPrices();
+  processElement(document.body);
+}
+
+function scheduleProcessPage() {
+  clearTimeout(observerTimer);
+  observerTimer = setTimeout(processPage, OBSERVER_DEBOUNCE_MS);
+}
+
+function observeDOMChanges() {
+  if (observer) {
+    observer.disconnect();
+  }
+
+  observer = new MutationObserver((mutations) => {
+    let shouldProcess = false;
+
+    for (const mutation of mutations) {
+      if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+        shouldProcess = true;
+        break;
+      }
+
+      if (mutation.type === 'characterData') {
+        shouldProcess = true;
+        break;
+      }
+    }
+
+    if (shouldProcess) {
+      scheduleProcessPage();
+    }
+  });
+
+  observer.observe(document.body, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+  });
+}
+
+function onStorageChange(changes, area) {
+  if (area !== 'sync') {
+    return;
+  }
+
+  let shouldReinitialize = false;
+
+  if ('hourlyIncome' in changes) {
+    hourlyIncome = changes.hourlyIncome.newValue > 0 ? changes.hourlyIncome.newValue : null;
+    shouldReinitialize = true;
+  }
+
+  if ('preferredLanguage' in changes) {
+    localizedMessages = loadLocalizedMessages(
+      changes.preferredLanguage.newValue || navigator.language.slice(0, 2) || 'en'
+    );
+    shouldReinitialize = true;
+  }
+
+  if ('preferredCurrency' in changes) {
+    userCurrency = changes.preferredCurrency.newValue || 'EUR';
+    priceRegex = buildPriceRegex();
+    shouldReinitialize = true;
+  }
+
+  if ('extensionEnabled' in changes) {
+    extensionEnabled = changes.extensionEnabled.newValue !== false;
+    shouldReinitialize = true;
+  }
+
+  if (!shouldReinitialize) {
+    return;
+  }
+
+  processedNodes = new WeakSet();
+  restoreOriginalText(document.body);
+
+  if (extensionEnabled && hourlyIncome) {
+    processPage();
+  }
+}
+
+function initializeExtension() {
+  injectStyles();
+  chrome.storage.onChanged.addListener(onStorageChange);
+
+  chrome.storage.sync.get(
+    ['hourlyIncome', 'preferredLanguage', 'preferredCurrency', 'extensionEnabled'],
+    (result) => {
+      hourlyIncome = result.hourlyIncome > 0 ? result.hourlyIncome : null;
+      const language = result.preferredLanguage || navigator.language.slice(0, 2) || 'en';
+      userCurrency = result.preferredCurrency || 'EUR';
+      extensionEnabled = result.extensionEnabled !== false;
+      localizedMessages = loadLocalizedMessages(language);
+      priceRegex = buildPriceRegex();
+      processedNodes = new WeakSet();
+
+      if (extensionEnabled && hourlyIncome) {
+        processPage();
+      }
+
+      observeDOMChanges();
+    }
+  );
+}
+
+initializeExtension();
